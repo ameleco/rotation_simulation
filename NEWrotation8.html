@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rotational Inertia – Torque & Force Visualization</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  body { background:#fff; margin:0; padding:20px; font-family:sans-serif; }
+  h2 { text-align:center; margin:10px 10px 4px; }
+  #controls { text-align:center; margin-bottom:8px; }
+  button, input[type=range], input[type=number] {
+    margin:4px; padding:4px 8px; font-size:14px;
+  }
+  label { margin:0 6px; font-size:14px; }
+  .readout {
+    font-size:12px; color:#444; margin-left:4px;
+    min-width:70px; display:inline-block; text-align:left;
+  }
+  canvas.sim {
+    display:block; margin:0 auto;
+    border:1px solid #ccc; background:#fff;
+  }
+  #chartContainer {
+    width:90%; max-width:900px;
+    margin:14px auto 20px;
+    position:relative;
+  }
+  #cursorLine {
+    position:absolute; top:0; bottom:0;
+    width:2px; background:red;
+    pointer-events:none;
+  }
+</style>
+</head>
+<body>
+<h2>Rotational Inertia – Torque & Force Visualization</h2>
+
+<div id="controls">
+  <button id="playBtn">▶ Release</button>
+  <button id="resetBtn">🔄 Reset</button><br>
+  <button id="copyBtn">📋 Copy Data</button>
+
+
+  <label>Left mass radius (r₁):
+    <input id="r1" type="range" min="0.15" max="0.45" step="0.01" value="0.35">
+    <span id="r1Val" class="readout"></span>
+  </label>
+
+  <label>Right mass radius (r₂):
+    <input id="r2" type="range" min="0.15" max="0.45" step="0.01" value="0.35">
+    <span id="r2Val" class="readout"></span>
+  </label><br>
+
+  <label>Left mass (m₁):
+    <input id="m1" type="number" min="10" max="100" step="5" value="50">
+  </label>
+
+  <label>Right mass (m₂):
+    <input id="m2" type="number" min="10" max="100" step="5" value="50">
+  </label>
+</div>
+
+<canvas id="c" class="sim" width="900" height="650"></canvas>
+
+<div id="measureBox" style="
+  position:absolute; 
+  top:40px; 
+  right:40px; 
+  padding:8px 10px;
+  border:1px solid #ccc;
+  background:#fff;
+  font-family:sans-serif;
+  font-size:13px;
+  display:block;
+  line-height:1.3em;
+">
+  θ = <span id="thetaVal"></span> rad<br>
+  ω = <span id="omegaVal"></span> rad/s<br>
+  α = <span id="alphaVal"></span> rad/s²
+</div>
+
+<div id="chartContainer">
+  <canvas id="chart" height="200"></canvas>
+  <div id="cursorLine"></div>
+</div>
+
+<script>
+/* === DOM === */
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const playBtn = document.getElementById("playBtn");
+const resetBtn = document.getElementById("resetBtn");
+const r1Slider = document.getElementById("r1");
+const r2Slider = document.getElementById("r2");
+const m1Input = document.getElementById("m1");
+const m2Input = document.getElementById("m2");
+const r1Val = document.getElementById("r1Val");
+const r2Val = document.getElementById("r2Val");
+const cursor = document.getElementById("cursorLine");
+
+/* === Geometry === */
+const yShift = -150;
+const xShift = 50;
+
+const box = { x:130 + xShift, y:360 + yShift, w:260, h:80 };
+const postX = box.x + box.w * 0.32;
+const spoolOffset = 10;
+
+const spoolTopY = box.y - 70 + spoolOffset;
+const spoolBottomY = spoolTopY + 18;
+const spoolW = 110;
+const spoolRadiusPx = spoolW / 2;
+const spoolCenterX = postX;
+const spoolCenterY = (spoolTopY + spoolBottomY) / 2;
+const spoolDepth = 8;
+
+const hubRadius = spoolRadiusPx * 0.65;
+const hubBottomY = spoolTopY;
+const hubHeight = 12;
+const hubTopY = hubBottomY - hubHeight;
+
+const spoolExitY = spoolCenterY + 1;
+
+const pulleyR = 45;
+const pulley = {
+  x: box.x + box.w + 160,
+  y: spoolExitY + pulleyR,
+  r: pulleyR
+};
+
+const pivotX = spoolCenterX;
+const pivotY = hubTopY - 3;
+const viewTilt = 0.06;
+
+const barLengthPx = spoolRadiusPx * 8.0;
+const barHalf = barLengthPx / 2;
+const barThick = 10;
+const ballR = 24;
+const depthAmp = 14;
+
+const massSizePx = 75;
+const massStartY = pulley.y + 80;
+
+/* === Physics constants === */
+const F = 100;              // N
+const r_spool_m = 0.05;     // m
+const dropHeight_m = 0.9;   // m (~3 ft)
+const pxPerM = spoolRadiusPx / r_spool_m;
+
+const r_min_m = 0.05;
+const r_max_m = 0.35;
+
+/* === State === */
+let theta = 0;
+let omega = 0;
+let alpha = 0;
+let timeElapsed = 0;
+let totalTime = 3;
+let running = false;
+let lastTs = null;
+
+/* === Chart === */
+const chartCtx = document.getElementById("chart").getContext("2d");
+const chart = new Chart(chartCtx, {
+  type: "line",
+  data: {
+    labels: [],
+    datasets: [
+      { label: "θ (rad)",    data: [], borderColor: "blue",  fill: false, pointRadius: 0 },
+      { label: "ω (rad/s)",  data: [], borderColor: "green", fill: false, pointRadius: 0 },
+      { label: "α (rad/s²)", data: [], borderColor: "red",   fill: false, pointRadius: 0 }
+    ]
+  },
+  options: {
+    animation: false,
+    responsive: true,
+    scales: {
+      x: { title: { display: true, text: "Time (s)" }, ticks: { maxTicksLimit: 8 } },
+      y: { title: { display: true, text: "Value" }, grid: { color: "#eee" } }
+    },
+    plugins: { legend: { position: "bottom" } }
+  }
+});
+
+/* === Helpers === */
+function sliderToRadiusMeters(v) {
+  const f = parseFloat(v);
+  const t = (f - 0.15) / (0.45 - 0.15);
+  return r_min_m + t * (r_max_m - r_min_m);
+}
+
+function radiusMetersToBarOffsetPx(r) {
+  const t = (r - r_min_m) / (r_max_m - r_min_m);
+  return t * (barHalf * 0.9);
+}
+
+function getMassesAndRadii() {
+  const m1 = Math.min(Math.max(parseFloat(m1Input.value) || 10, 10), 100);
+  const m2 = Math.min(Math.max(parseFloat(m2Input.value) || 10, 10), 100);
+  const r1 = sliderToRadiusMeters(r1Slider.value);
+  const r2 = sliderToRadiusMeters(r2Slider.value);
+  return { m1, m2, r1, r2 };
+}
+
+function computeInertia() {
+  const { m1, m2, r1, r2 } = getMassesAndRadii();
+  // Only the two masses contribute: I = m1 r1^2 + m2 r2^2
+  return m1 * r1 * r1 + m2 * r2 * r2;
+}
+
+function updateRadiusReadouts() {
+  const { r1, r2 } = getMassesAndRadii();
+  r1Val.textContent = `${r1.toFixed(3)} m`;
+  r2Val.textContent = `${r2.toFixed(3)} m`;
+}
+
+/* === Drawing === */
+function drawBaseAndPost() {
+  ctx.fillStyle = "#222";
+  ctx.beginPath();
+  ctx.moveTo(box.x, box.y + box.h);
+  ctx.lineTo(box.x, box.y + 10);
+  ctx.quadraticCurveTo(box.x + box.w * 0.1, box.y, box.x + box.w * 0.25, box.y);
+  ctx.lineTo(box.x + box.w, box.y);
+  ctx.lineTo(box.x + box.w, box.y + box.h);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.fillStyle = "#000";
+  ctx.fillRect(postX - 5, box.y - 70 + spoolOffset, 10, 70);
+}
+
+function drawHolder() {
+  const baseX = box.x + box.w;
+  const baseY = box.y + box.h * 0.5;
+  const tipX = pulley.x;
+  const tipY = pulley.y;
+
+  ctx.fillStyle = "#146b25";
+  ctx.beginPath();
+  ctx.moveTo(baseX, baseY);
+  ctx.lineTo(baseX, box.y);
+  ctx.lineTo(tipX, tipY);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.fillStyle = "#d4aa00";
+  ctx.beginPath();
+  ctx.arc(pulley.x, pulley.y, 5, 0, 2 * Math.PI);
+  ctx.fill();
+}
+
+function drawSpool(thetaLocal) {
+  // bottom ellipse
+  ctx.fillStyle = "#202020";
+  ctx.beginPath();
+  ctx.ellipse(
+    spoolCenterX,
+    spoolBottomY,
+    spoolRadiusPx,
+    spoolDepth,
+    0,
+    0,
+    Math.PI,
+    false
+  );
+  ctx.fill();
+
+  // body
+  ctx.fillStyle = "#333";
+  ctx.fillRect(
+    spoolCenterX - spoolRadiusPx,
+    spoolTopY,
+    spoolRadiusPx * 2,
+    spoolBottomY - spoolTopY
+  );
+
+  // top ellipse
+  ctx.fillStyle = "#555";
+  ctx.beginPath();
+  ctx.ellipse(
+    spoolCenterX,
+    spoolTopY,
+    spoolRadiusPx,
+    spoolDepth,
+    0,
+    0,
+    2 * Math.PI
+  );
+  ctx.fill();
+
+  // rotating notches
+  ctx.save();
+  ctx.translate(spoolCenterX, spoolTopY);
+  ctx.strokeStyle = "#bbb";
+  ctx.lineWidth = 0.8;
+  const n = 10;
+  for (let i = 0; i < n; i++) {
+    const a = thetaLocal + (i / n) * 2 * Math.PI;
+    const xO = Math.cos(a) * (spoolRadiusPx - 2);
+    const yO = Math.sin(a) * spoolDepth;
+    const xI = Math.cos(a) * (spoolRadiusPx - 8);
+    const yI = Math.sin(a) * spoolDepth;
+    ctx.beginPath();
+    ctx.moveTo(xI, yI);
+    ctx.lineTo(xO, yO);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawHub() {
+  const ry = spoolDepth * 0.6;
+  ctx.fillStyle = "#666";
+  ctx.fillRect(
+    spoolCenterX - hubRadius,
+    hubTopY,
+    hubRadius * 2,
+    hubBottomY - hubTopY
+  );
+  ctx.fillStyle = "#444";
+  ctx.beginPath();
+  ctx.ellipse(spoolCenterX, hubBottomY, hubRadius, ry, 0, 0, Math.PI, false);
+  ctx.fill();
+  ctx.fillStyle = "#777";
+  ctx.beginPath();
+  ctx.ellipse(spoolCenterX, hubTopY, hubRadius, ry, 0, 0, 2 * Math.PI);
+  ctx.fill();
+}
+
+function drawPulley(thetaCW) {
+  ctx.save();
+  ctx.translate(pulley.x, pulley.y);
+  ctx.rotate(thetaCW);
+  const blades = 8;
+  for (let i = 0; i < blades; i++) {
+    if (i % 2 === 0) {
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.arc(
+        0,
+        0,
+        pulley.r,
+        (i / blades) * 2 * Math.PI,
+        ((i + 1) / blades) * 2 * Math.PI
+      );
+      ctx.closePath();
+      ctx.fillStyle = "#000";
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+
+  ctx.lineWidth = 5;
+  ctx.strokeStyle = "#000";
+  ctx.beginPath();
+  ctx.arc(pulley.x, pulley.y, pulley.r, 0, 2 * Math.PI);
+  ctx.stroke();
+}
+
+function drawRopeWraps(progress) {
+  const baseY = spoolCenterY + 1;
+  const offset = 3;
+  const totalWraps = 4;
+  const wraps = Math.max(1, Math.round(totalWraps - progress * (totalWraps - 1)));
+
+  ctx.strokeStyle = "#d4aa00";
+  ctx.lineWidth = 3;
+
+  for (let i = 0; i < wraps; i++) {
+    const y = baseY - i * offset;
+    ctx.beginPath();
+    ctx.ellipse(spoolCenterX, y, spoolRadiusPx, spoolDepth, 0, 0, Math.PI, false);
+    ctx.stroke();
+  }
+
+  return { x: spoolCenterX + spoolRadiusPx + 2, y: baseY };
+}
+
+function drawRopeAndMass(anchor, massY) {
+  ctx.strokeStyle = "#d4aa00";
+  ctx.lineWidth = 3;
+
+  ctx.beginPath();
+  ctx.moveTo(anchor.x, anchor.y);
+  ctx.lineTo(pulley.x, pulley.y - pulley.r);
+  ctx.arc(pulley.x, pulley.y, pulley.r, -Math.PI / 2, 0, false);
+  ctx.lineTo(pulley.x + pulley.r, massY);
+  ctx.stroke();
+
+  // hanging block
+  ctx.fillStyle = "#888";
+  ctx.fillRect(
+    pulley.x + pulley.r - massSizePx / 2,
+    massY,
+    massSizePx,
+    massSizePx
+  );
+}
+
+/* === Static torque & force arrows (always visible) === */
+function drawStaticTorqueAndForces() {
+  ctx.strokeStyle = "#0077ff";
+  ctx.fillStyle = "#0077ff";
+  ctx.lineWidth = 2;
+  ctx.font = "13px sans-serif";
+
+  // r_spool arm beneath spool
+  const offsetY = 24;
+  const y = spoolCenterY + offsetY;
+  const armLen = r_spool_m * pxPerM;
+  const x0 = spoolCenterX;
+  const x1 = x0 + armLen;
+
+  ctx.beginPath();
+  ctx.moveTo(x0, y);
+  ctx.lineTo(x1, y);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(x1 - 5, y - 3);
+  ctx.lineTo(x1 - 5, y + 3);
+  ctx.lineTo(x1, y);
+  ctx.closePath();
+  ctx.fill();
+
+  // Shift label right so it's clear of the post
+  ctx.textAlign = "left";
+  ctx.fillText("r_spool = 0.05 m", x1 + 20, y + 4);
+
+  // F = T = 100 N above pulley
+  const Fy = pulley.y - pulley.r - 40;
+  const Fx0 = pulley.x - 30;
+  const Fx1 = Fx0 + 50;
+  ctx.beginPath();
+  ctx.moveTo(Fx0, Fy);
+  ctx.lineTo(Fx1, Fy);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(Fx1 - 5, Fy - 3);
+  ctx.lineTo(Fx1 - 5, Fy + 3);
+  ctx.lineTo(Fx1, Fy);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillText("F = T = 100 N", Fx1 + 6, Fy + 4);
+
+  // F_g = 100 N to the right of the block (not attached)
+  const blockCenterY = massStartY + massSizePx / 2;
+  const gX = pulley.x + pulley.r + massSizePx + 26;
+  const gTop = blockCenterY - 24;
+  const gBot = blockCenterY + 24;
+  ctx.beginPath();
+  ctx.moveTo(gX, gTop);
+  ctx.lineTo(gX, gBot);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(gX - 4, gBot - 6);
+  ctx.lineTo(gX + 4, gBot - 6);
+  ctx.lineTo(gX, gBot);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillText("F_g = 100 N", gX - 30, gTop - 4);
+}
+
+/* === Bar & masses === */
+function drawBar3D(x1, y1, x2, y2) {
+  const vx = x2 - x1, vy = y2 - y1;
+  const L = Math.max(1e-6, Math.hypot(vx, vy));
+  const px = -vy / L, py = vx / L;
+  const half = barThick / 2;
+  const ox = px * half, oy = py * half;
+
+  const A = { x: x1 + ox, y: y1 + oy };
+  const B = { x: x2 + ox, y: y2 + oy };
+  const C = { x: x2 - ox, y: y2 - oy };
+  const D = { x: x1 - ox, y: y1 - oy };
+
+  const grad = ctx.createLinearGradient(A.x, A.y, D.x, D.y);
+  grad.addColorStop(0, "#e0e0e0");
+  grad.addColorStop(1, "#888");
+
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.moveTo(A.x, A.y);
+  ctx.lineTo(B.x, B.y);
+  ctx.lineTo(C.x, C.y);
+  ctx.lineTo(D.x, D.y);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawBarNotches(thetaLocal) {
+  const notchRadii = [0.05, 0.15, 0.25, 0.35];
+  const cosT = Math.cos(thetaLocal);
+  const sinT = Math.sin(thetaLocal);
+
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 1.1;
+
+  notchRadii.forEach(r_m => {
+    const off = radiusMetersToBarOffsetPx(r_m);
+    const x = pivotX + off * cosT;
+    const y = pivotY + off * sinT * viewTilt;
+    const tLen = 6;
+    const px = -sinT;
+    const py = cosT;
+    ctx.beginPath();
+    ctx.moveTo(x - px * tLen / 2, y - py * tLen / 2);
+    ctx.lineTo(x + px * tLen / 2, y + py * tLen / 2);
+    ctx.stroke();
+  });
+}
+
+function drawMassDepth(x, y, depthFactor) {
+  const radius = ballR * (1 + 0.18 * depthFactor);
+  const bright = Math.round(130 + 70 * depthFactor);
+  ctx.fillStyle = `rgb(${bright},${bright},${bright})`;
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, 2 * Math.PI);
+  ctx.fill();
+  ctx.strokeStyle = "#444";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // center dot
+  ctx.fillStyle = "#cc0000";
+  ctx.beginPath();
+  ctx.arc(x, y, 2.5, 0, 2 * Math.PI);
+  ctx.fill();
+}
+
+function drawRotatingMasses(thetaLocal) {
+  const cosT = Math.cos(thetaLocal);
+  const sinT = Math.sin(thetaLocal);
+  const { r1, r2 } = getMassesAndRadii();
+  const r1px = radiusMetersToBarOffsetPx(r1);
+  const r2px = radiusMetersToBarOffsetPx(r2);
+  const rightD = Math.sin(thetaLocal);
+  const leftD = -rightD;
+
+  const x1 = pivotX - barHalf * cosT;
+  const x2 = pivotX + barHalf * cosT;
+  const y1 = pivotY - barHalf * sinT * viewTilt + depthAmp * leftD;
+  const y2 = pivotY + barHalf * sinT * viewTilt + depthAmp * rightD;
+
+  drawBar3D(x1, y1, x2, y2);
+  drawBarNotches(thetaLocal);
+
+  const mxL = pivotX - r1px * cosT;
+  const myL = pivotY - r1px * sinT * viewTilt + depthAmp * leftD;
+
+  const mxR = pivotX + r2px * cosT;
+  const myR = pivotY + r2px * sinT * viewTilt + depthAmp * rightD;
+
+  if (rightD > 0) {
+    drawMassDepth(mxL, myL, leftD);
+    drawMassDepth(mxR, myR, rightD);
+  } else {
+    drawMassDepth(mxR, myR, rightD);
+    drawMassDepth(mxL, myL, leftD);
+  }
+
+  // pivot screw
+  ctx.fillStyle = "#000";
+  ctx.beginPath();
+  ctx.arc(pivotX, pivotY, 3, 0, 2 * Math.PI);
+  ctx.fill();
+}
+
+/* === Physics step === */
+function stepPhysics(dt) {
+  const I = computeInertia();
+  const tau = F * r_spool_m;
+  alpha = I > 0 ? tau / I : 0;
+  omega += alpha * dt;
+  theta += omega * dt;
+}
+
+/* === Render frame === */
+function render() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const ropeUnwound = theta * r_spool_m;
+  const progress = Math.min(1, ropeUnwound / dropHeight_m);
+  const thetaPulley = (ropeUnwound * pxPerM) / pulley.r;
+  const massY = massStartY + ropeUnwound * pxPerM;
+
+  drawBaseAndPost();
+  drawSpool(theta);
+  drawHub();
+  const anchor = drawRopeWraps(progress);
+  drawRopeAndMass(anchor, massY);
+  drawPulley(thetaPulley);
+  drawHolder();
+  drawRotatingMasses(theta);
+  drawStaticTorqueAndForces();
+  updateRadiusReadouts();
+}
+
+/* === Chart & cursor === */
+function updateChart(dt) {
+  timeElapsed += dt;
+  chart.data.labels.push(timeElapsed.toFixed(2));
+  chart.data.datasets[0].data.push(theta);
+  chart.data.datasets[1].data.push(omega);
+  chart.data.datasets[2].data.push(alpha);
+  chart.update("none");
+
+  const width = document.getElementById("chart").clientWidth || 900;
+  const frac = totalTime > 0 ? Math.min(timeElapsed / totalTime, 1) : 0;
+  cursor.style.left = (frac * (width - 2)) + "px";
+}
+
+function resetChart() {
+  timeElapsed = 0;
+  chart.data.labels = [];
+  chart.data.datasets.forEach(d => d.data = []);
+  chart.update();
+  cursor.style.left = "0px";
+}
+
+/* === Animation loop === */
+function animate(ts) {
+  if (!running) {
+    render();
+    return;
+  }
+
+  if (lastTs == null) lastTs = ts;
+  let dt = (ts - lastTs) / 1000;
+  if (dt > 0.04) dt = 0.04;
+  lastTs = ts;
+
+  stepPhysics(dt);
+  updateMeasurements(); 
+
+  const ropeUnwound = theta * r_spool_m;
+  if (ropeUnwound >= dropHeight_m) {
+    theta = dropHeight_m / r_spool_m;
+    omega = 0;
+    alpha = 0;
+    render();
+    updateChart(dt);
+    running = false;
+    return;
+  }
+
+  render();
+  updateChart(dt);
+
+  if (running) requestAnimationFrame(animate);
+}
+
+/* === Controls === */
+playBtn.onclick = () => {
+  if (!running) {
+    const I = computeInertia();
+    if (I <= 0) return;
+    const tau = F * r_spool_m;
+    const alphaConst = tau / I;
+    // 0.5 * alpha * r_spool * t^2 = dropHeight_m  =>  t = sqrt(2 h / (alpha r_spool))
+    totalTime = Math.sqrt(2 * dropHeight_m / (alphaConst * r_spool_m));
+    running = true;
+    lastTs = null;
+    showMeasurements(true);  
+    requestAnimationFrame(animate);
+  }
+};
+
+resetBtn.onclick = () => {
+  running = false;
+  theta = 0;
+  omega = 0;
+  alpha = 0;
+  lastTs = null;
+  resetChart();
+
+  // Clear the readout box values
+  thetaVal.textContent = "";
+  omegaVal.textContent = "";
+  alphaVal.textContent = "";
+
+  render();
+};
+
+const copyBtn = document.getElementById("copyBtn");
+copyBtn.onclick = () => {
+  const labels = chart.data.labels;
+  const θ = chart.data.datasets[0].data;
+  const ω = chart.data.datasets[1].data;
+  const α = chart.data.datasets[2].data;
+
+  let tsv = "t (s)\tθ (rad)\tω (rad/s)\tα (rad/s²)\n";
+  const n = Math.min(50, labels.length);
+  const start = Math.max(0, labels.length - n);
+
+  for (let i = start; i < labels.length; i++) {
+    tsv += `${labels[i]}\t${θ[i].toFixed(4)}\t${ω[i].toFixed(4)}\t${α[i].toFixed(4)}\n`;
+  }
+
+  navigator.clipboard.writeText(tsv).then(() => {
+    alert("Copied last " + n + " rows to clipboard!");
+  });
+};
+
+
+/* Update on slider/mass changes when paused */
+[r1Slider, r2Slider, m1Input, m2Input].forEach(el => {
+  el.addEventListener("input", () => {
+    if (!running) {
+      render();
+    }
+  });
+});
+
+/* Initial frame */
+render();
+const measureBox = document.getElementById("measureBox");
+const thetaVal = document.getElementById("thetaVal");
+const omegaVal = document.getElementById("omegaVal");
+const alphaVal = document.getElementById("alphaVal");
+
+function updateMeasurements() {
+  thetaVal.textContent = theta.toFixed(3);
+  omegaVal.textContent = omega.toFixed(3);
+  alphaVal.textContent = alpha.toFixed(3);
+}
+
+function showMeasurements(show) {
+  measureBox.style.display = show ? "block" : "none";
+}
+</script>
+</body>
+</html>
